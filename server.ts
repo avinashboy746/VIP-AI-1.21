@@ -13,10 +13,25 @@ const app = express();
 const PORT = 3000;
 
 // Gemini Setup
-const ai = new GoogleGenAI({ 
-  apiKey: process.env.GEMINI_API_KEY || "" 
-});
-const model = "gemini-3-flash-preview";
+let aiClient: GoogleGenAI | null = null;
+function getGeminiClient(): GoogleGenAI {
+  if (!aiClient) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error("GEMINI_API_KEY is not defined in server environment variables.");
+    }
+    aiClient = new GoogleGenAI({
+      apiKey: apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        }
+      }
+    });
+  }
+  return aiClient;
+}
+const model = "gemini-3.5-flash";
 
 // Discord Bot Setup
 const bot = new Client({ 
@@ -27,6 +42,9 @@ const bot = new Client({
     GatewayIntentBits.GuildMembers
   ] 
 });
+
+// In-memory conversational history for Discord channels/users (limit to last 10 messages to keep context/prevent blowup)
+const discordConversations = new Map<string, { role: "user" | "model"; parts: { text: string }[] }[]>();
 
 if (process.env.DISCORD_BOT_TOKEN) {
   bot.login(process.env.DISCORD_BOT_TOKEN).then(() => {
@@ -73,13 +91,39 @@ bot.on('messageCreate', async (message) => {
     try {
       await message.channel.sendTyping();
 
-      const systemPrompt = "You are 'VIP AI CHAT', the elite AI assistant. You are professional, authoritative, and helpful. You speak in Hindi, Hinglish, and English.";
-      const response = await ai.models.generateContent({
+      const systemInstruction = "You are 'VIP AI CHAT', the elite AI assistant. You are professional, authoritative, and helpful. You speak in Hindi, Hinglish, and English. Match the conversation language and remember the history of this discussion to give continuous, relevant answers.";
+      
+      const convoKey = `${message.channelId}-${message.author.id}`;
+      let history = discordConversations.get(convoKey) || [];
+
+      // Add user's latest query
+      history.push({
+        role: "user",
+        parts: [{ text: prompt }]
+      });
+
+      // Keep only last 10 messages (5 turns)
+      if (history.length > 10) {
+        history = history.slice(history.length - 10);
+      }
+
+      const client = getGeminiClient();
+      const response = await client.models.generateContent({
         model: model,
-        contents: `${systemPrompt}\n\nClient request: ${prompt}`,
+        contents: history,
+        config: {
+          systemInstruction: systemInstruction,
+        }
       });
 
       const text = response.text || "Terminal error: No response generated.";
+
+      // Add model's latest reply to conversational memory
+      history.push({
+        role: "model",
+        parts: [{ text: text }]
+      });
+      discordConversations.set(convoKey, history);
 
       // Split text if it's too long (Discord limit is 2000 chars)
       if (text.length > 2000) {
@@ -237,6 +281,50 @@ app.post("/api/logout", (req, res) => {
   req.session.destroy(() => {
     res.json({ success: true });
   });
+});
+
+// Server-side robust streaming AI Chat API
+app.post("/api/chat", async (req, res) => {
+  const { messages } = req.body;
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: "Invalid messages configuration" });
+  }
+
+  try {
+    const client = getGeminiClient();
+    
+    // Set headers for SSE/chunked transmission
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Transfer-Encoding", "chunked");
+
+    // Convert client-sent messages to the standard format required by generateContentStream
+    const formattedContents = messages.map(msg => ({
+      role: msg.role === "user" ? "user" : "model",
+      parts: [{ text: msg.content }]
+    }));
+
+    const responseStream = await client.models.generateContentStream({
+      model: model,
+      contents: formattedContents,
+      config: {
+        systemInstruction: "You are 'VIP AI CHAT', the Ultimate Tech Oracle and Business Strategist. You are an elite expert in Full-Stack Web Development, Mobile App Architecture, and Discord Bot Automation. Your personality is professional, authoritative, and helpful. You provide complete, production-ready code blocks and explain complex concepts simply. You can speak in Hindi, Hinglish, and English. You are the 'Master' of technology.",
+      }
+    });
+
+    for await (const chunk of responseStream) {
+      if (chunk.text) {
+        res.write(chunk.text);
+      }
+    }
+    res.end();
+  } catch (error: any) {
+    console.error("Server API Chat Streaming error:", error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: error?.message || "Failed to generate AI response" });
+    } else {
+      res.end();
+    }
+  }
 });
 
 // Vite Middleware
